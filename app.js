@@ -3,7 +3,7 @@
  */
 'use strict';
 (() => {
-  const VERSION = '1.2.2';
+  const VERSION = '1.3.0';
   const API = 'https://api.themoviedb.org/3';
   const IMG = 'https://image.tmdb.org/t/p/';
   const LANG = 'de-DE';
@@ -24,7 +24,7 @@
   const saveFilters = () => store.set('filters', F);
 
   const G = Object.assign({ status: 'all', trendWin: 'week', trendType: 'all', trendMine: true, upMode: 'tv', query: '' }, store.get('ui', {}));
-  const saveUI = () => store.set('ui', { status: G.status, trendWin: G.trendWin, trendType: G.trendType, trendMine: G.trendMine, upMode: G.upMode, wlSort: G.wlSort });
+  const saveUI = () => store.set('ui', { status: G.status, trendWin: G.trendWin, trendType: G.trendType, trendMine: G.trendMine, upMode: G.upMode, wlSort: G.wlSort, wlTab: G.wlTab, favType: G.favType });
 
   /* ================= Helpers ================= */
   const $ = (s, r = document) => r.querySelector(s);
@@ -315,14 +315,50 @@
       const it = j && j.Items && j.Items[0];
       return !!(it && it.UserData && it.UserData.IsFavorite);
     },
+    fav: store.get('jffav', null),
+    favTs: 0,
+    isFav(type, id) { return !!(this.fav && this.fav[type === 'movie' ? 'm' : 's'][id]); },
+    async loadFavorites() {
+      if (!this.conn) return false;
+      const u = this.conn.userId;
+      const qs = 'Recursive=true&IncludeItemTypes=Movie,Series&Filters=IsFavorite&Fields=ProviderIds,ProductionYear&EnableImageTypes=Primary&ImageTypeLimit=1&EnableUserData=false&SortBy=SortName&SortOrder=Ascending&Limit=2000';
+      const j = await this.req('GET', [`/Items?userId=${u}&${qs}`, `/Users/${u}/Items?${qs}`]);
+      const m = {}; const s = {}; const items = [];
+      for (const it of (j && j.Items) || []) {
+        const pid = it.ProviderIds || {};
+        const tm = pid.Tmdb || pid.tmdb || pid.TMDb || null;
+        const type = it.Type === 'Movie' ? 'movie' : 'tv';
+        if (tm) (type === 'movie' ? m : s)[tm] = it.Id;
+        items.push({ id: it.Id, n: it.Name, type, y: it.ProductionYear || '', tmdb: tm, tag: (it.ImageTags && it.ImageTags.Primary) || '' });
+      }
+      const before = JSON.stringify(this.fav && [this.fav.m, this.fav.s]);
+      this.fav = { ts: Date.now(), m, s, items };
+      this.favTs = Date.now();
+      store.set('jffav', this.fav);
+      return before !== JSON.stringify([m, s]);
+    },
+    favLocal(type, id, on, info) {
+      if (!this.fav) this.fav = { ts: 0, m: {}, s: {}, items: [] };
+      const map = this.fav[type === 'movie' ? 'm' : 's'];
+      const iid = this.iid(type, id);
+      if (on) {
+        map[id] = iid;
+        if (!this.fav.items.some((x) => x.id === iid)) this.fav.items.push({ id: iid, n: info.title, type, y: year(info.date), tmdb: String(id), tag: '' });
+      } else {
+        delete map[id];
+        this.fav.items = this.fav.items.filter((x) => x.id !== iid);
+      }
+      store.set('jffav', this.fav);
+      paintBadges(type + ':' + id);
+    },
     async setFavorite(type, id, on) {
       const iid = this.iid(type, id); const u = this.conn.userId;
       await this.req(on ? 'POST' : 'DELETE', [`/UserFavoriteItems/${iid}?userId=${u}`, `/Users/${u}/FavoriteItems/${iid}`]);
     },
     disconnect() {
       if (this.conn) fetch(this.conn.url + '/Sessions/Logout', { method: 'POST', headers: { Authorization: this.auth(this.conn.token) } }).catch(() => {});
-      this.conn = null; this.lib = null;
-      store.del('jf'); store.del('jflib');
+      this.conn = null; this.lib = null; this.fav = null;
+      store.del('jf'); store.del('jflib'); store.del('jffav');
       updateJfDot();
     },
   };
@@ -454,14 +490,25 @@
     b.textContent = n > 99 ? '99+' : String(n); b.hidden = !n;
   }
   const wlBadgeHTML = '<span class="wlb" title="Auf der Merkliste"><svg><use href="#i-bookmark-fill"/></svg></span>';
-  function paintWl(k) {
-    $$(`.tile[data-k="${k}"] .poster`).forEach((p) => {
-      const has = WL.has(k) && !p.querySelector('.srv');
-      const cur = p.querySelector('.wlb');
-      if (has && !cur) p.insertAdjacentHTML('beforeend', wlBadgeHTML);
-      if (!has && cur) cur.remove();
+  const favBadgeHTML = '<span class="srv favb" title="Jellyfin-Favorit (auf dem Server)"><svg><use href="#i-heart-fill"/></svg></span>';
+  /* Ein Abzeichen oben rechts: Favorit (Herz) > auf dem Server (Haken) > Merkliste (Lesezeichen) */
+  function badgeFor(type, id) {
+    if (JF.isFav(type, id)) return favBadgeHTML;
+    if (JF.has(type, id)) return '<span class="srv" title="Auf dem Server"><svg><use href="#i-check"/></svg></span>';
+    if (WL.has(type + ':' + id)) return wlBadgeHTML;
+    return '';
+  }
+  function paintBadges(k) {
+    const [type, id] = k.split(':');
+    $$(`.tile[data-k="${k}"], .lrow:not(.wlrow)[data-k="${k}"]`).forEach((el) => {
+      const host = el.classList.contains('tile') ? el.querySelector('.poster') : el.querySelector('.lr');
+      if (!host) return;
+      host.querySelectorAll(':scope > .srv, :scope > .wlb').forEach((b) => b.remove());
+      const html = badgeFor(type, +id);
+      if (html) host.insertAdjacentHTML('beforeend', html);
     });
   }
+  const paintWl = paintBadges;
 
   /* Lesezeichen-Skript für Seerr: liest die Watchlist auf der Seerr-Seite aus (eigenständig, wird als Text serialisiert) */
   function seerrExport() {
@@ -642,7 +689,7 @@
     if (o.badge === 'nextep') badge = `<span class="tile-date" data-ne ${ne && ne[2] ? '' : 'hidden'}>${ne && ne[2] ? fmtRel(ne[2]) : ''}</span>`;
     const y = year(it.date);
     return `<button class="tile" data-k="${k}" type="button">
-      <div class="poster">${img}<span class="pill ${it.type}">${it.type === 'movie' ? 'Film' : 'Serie'}</span>${JF.has(it.type, it.id) ? srvBadge : (WL.has(k) ? wlBadgeHTML : '')}<div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${badge}</div>
+      <div class="poster">${img}<span class="pill ${it.type}">${it.type === 'movie' ? 'Film' : 'Serie'}</span>${badgeFor(it.type, it.id)}<div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${badge}</div>
       <div class="tile-meta"><div class="t">${esc(it.title)}</div><div class="s">${y ? `<span>${y}</span>` : ''}${ratingHTML(it)}</div></div>
     </button>`;
   }
@@ -658,7 +705,7 @@
       <div class="lp">${img}</div>
       <div class="lmin"><div class="lt">${esc(it.title)}</div>
         <div class="ls"><span class="tag ${it.type}">${it.type === 'movie' ? 'Film' : 'Serie'}</span>${year(it.date) ? `<span>${year(it.date)}</span>` : ''}${ratingHTML(it)}${extra}</div></div>
-      <div class="lr"><div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${JF.has(it.type, it.id) ? srvBadge : ''}</div>
+      <div class="lr"><div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${badgeFor(it.type, it.id)}</div>
     </button>`;
   }
 
@@ -1074,8 +1121,47 @@
     el.innerHTML = `${WL.lastSync ? `Mit Jellyfin synchronisiert · ${new Date(WL.lastSync).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}` : 'Mit Jellyfin synchronisiert'} · <button class="link-btn" type="button" data-wl-diag>Sync testen</button>`;
   }
 
+  function favTileHTML(f) {
+    const k = f.tmdb ? `${f.type}:${f.tmdb}` : '';
+    const src = `${JF.conn.url}/Items/${f.id}/Images/Primary?fillHeight=330&quality=85${f.tag ? '&tag=' + encodeURIComponent(f.tag) : ''}`;
+    return `<button class="tile" type="button" ${k ? `data-k="${k}"` : `data-jf="${esc(f.id)}"`}>
+      <div class="poster"><div class="noimg">${esc(f.n)}</div><img src="${src}" alt="" loading="lazy" decoding="async" onerror="this.remove()"><span class="pill ${f.type}">${f.type === 'movie' ? 'Film' : 'Serie'}</span>${favBadgeHTML}</div>
+      <div class="tile-meta"><div class="t">${esc(f.n)}</div><div class="s">${f.y ? `<span>${f.y}</span>` : ''}</div></div>
+    </button>`;
+  }
+
+  async function drawFavorites(el, tok) {
+    const body = $('#wl-body', el);
+    if (!JF.conn) { body.innerHTML = '<div class="card" style="max-width:640px"><h2>Jellyfin nicht verbunden</h2><p>Die Favoriten kommen aus deinem Jellyfin-Konto.</p><button class="btn primary" type="button" data-go="einstellungen">Jellyfin verbinden</button></div>'; return; }
+    const paint = () => {
+      const all = (JF.fav && JF.fav.items) || [];
+      const ft = G.favType || 'all';
+      const list = all.filter((f) => ft === 'all' || f.type === ft).sort((a, b) => a.n.localeCompare(b.n, 'de'));
+      const cnt = $('#fav-count'); if (cnt) cnt.textContent = all.length ? ` (${all.length})` : '';
+      if (!all.length) { body.innerHTML = '<div class="card" style="max-width:640px"><h2>Noch keine Favoriten</h2><p>Öffne einen Titel mit grünem Haken (auf dem Server) und tippe auf <b>«Zu Favoriten»</b>. Favoriten, die du direkt in Jellyfin setzt, erscheinen hier ebenfalls.</p></div>'; return; }
+      body.innerHTML = `<div class="toolbar"><div class="seg" role="group" aria-label="Typ">${[['all', 'Alle'], ['movie', 'Filme'], ['tv', 'Serien']].map(([v, l]) => `<button type="button" data-favtype="${v}" aria-pressed="${ft === v}">${l}</button>`).join('')}</div><span class="kv">${list.length} Titel</span></div>
+        <div class="grid">${list.map(favTileHTML).join('')}</div>`;
+    };
+    paint();
+    if (!JF.fav || Date.now() - JF.favTs > 30e3) {
+      if (!JF.fav) body.innerHTML = '<div class="spinner"></div>';
+      try { await JF.loadFavorites(); } catch (e) { if (alive(tok)) body.innerHTML = `<div class="card"><h2>Favoriten nicht geladen</h2><p>${esc(e.message)}</p><button class="btn" type="button" data-retry>Erneut versuchen</button></div>`; return; }
+      if (alive(tok)) paint();
+    }
+  }
+
   VIEWS.merkliste = async (el, tok) => {
-    el.innerHTML = `<div class="view-head"><h1>Merkliste</h1><span class="spacer"></span>
+    const favTab = G.wlTab === 'fav';
+    const nFav = JF.fav && JF.fav.items ? JF.fav.items.length : 0;
+    const switcher = `<div class="seg wl-tabs" role="tablist" aria-label="Bereich">
+        <button type="button" role="tab" data-wltab="list" aria-pressed="${!favTab}"><svg><use href="#i-bookmark"/></svg>Merkliste${WL.count() ? ` (${WL.count()})` : ''}</button>
+        <button type="button" role="tab" data-wltab="fav" aria-pressed="${favTab}"><svg><use href="#i-heart"/></svg>Favoriten<span id="fav-count">${nFav ? ` (${nFav})` : ''}</span></button></div>`;
+    if (favTab) {
+      el.innerHTML = `<div class="view-head">${switcher}</div><div id="wl-body"></div>`;
+      await drawFavorites(el, tok);
+      return;
+    }
+    el.innerHTML = `<div class="view-head">${switcher}<span class="spacer"></span>
         <button class="chip" type="button" data-wl-import><svg style="width:16px;height:16px"><use href="#i-download"/></svg>Aus Seerr importieren</button></div>
       <p class="kv" id="wl-sync" style="margin:-6px 0 14px"></p>
       ${WL.count() > 1 ? `<div class="toolbar"><div class="seg" role="group" aria-label="Reihenfolge">${[['new', 'Neueste zuerst'], ['old', 'Älteste zuerst']].map(([v, l]) => `<button type="button" data-wlsort="${v}" aria-pressed="${(G.wlSort || 'new') === v}">${l}</button>`).join('')}</div></div>` : ''}
@@ -1398,7 +1484,7 @@
         ${wp.link ? `<a class="link-btn" href="${esc(wp.link)}" target="_blank" rel="noopener">Alle Angebote<svg><use href="#i-ext"/></svg></a>` : ''}
         ${d.imdb_id ? `<a class="link-btn" href="https://www.imdb.com/title/${esc(d.imdb_id)}/" target="_blank" rel="noopener">IMDb<svg><use href="#i-ext"/></svg></a>` : ''}
       </div>`;
-    if (have && JF.conn) wireFavorite(type, id, my);
+    if (have && JF.conn) wireFavorite(type, id, my, { title, date });
     const dr = $('#d-req');
     if (dr) dr.addEventListener('click', () => { const k = type + ':' + id; if (WL.has(k)) { WL.setRequested(k, true); toast('Auf der Merkliste als angefragt markiert', 4500, { label: 'Rückgängig', fn: () => WL.setRequested(k, false) }); } });
     const wb = $('#d-wl');
@@ -1420,7 +1506,7 @@
   }
   openDetail.n = 0;
 
-  async function wireFavorite(type, id, my) {
+  async function wireFavorite(type, id, my, info = {}) {
     const b = $('#d-fav'); if (!b) return;
     const paint = (on) => {
       b.classList.toggle('on', on);
@@ -1430,12 +1516,16 @@
       b.title = on ? 'Aus Jellyfin-Favoriten entfernen' : 'Zu Jellyfin-Favoriten hinzufügen';
     };
     let on = false;
-    try { on = await JF.isFavorite(type, id); } catch { /* Status unbekannt: als «nicht Favorit» anzeigen */ }
+    try { on = await JF.isFavorite(type, id); if (on !== JF.isFav(type, id)) JF.favLocal(type, id, on, info); } catch { /* Status unbekannt: als «nicht Favorit» anzeigen */ }
     if (my !== openDetail.n) return;
     paint(on); b.disabled = false;
     b.onclick = async () => {
       b.disabled = true;
-      try { await JF.setFavorite(type, id, !on); on = !on; paint(on); toast(on ? 'Zu Jellyfin-Favoriten hinzugefügt' : 'Aus Favoriten entfernt'); } catch (e) { toast(e.message, 4000); }
+      try {
+        await JF.setFavorite(type, id, !on); on = !on; paint(on);
+        JF.favLocal(type, id, on, info);
+        toast(on ? 'Zu Jellyfin-Favoriten hinzugefügt' : 'Aus Favoriten entfernt');
+      } catch (e) { toast(e.message, 4000); }
       b.disabled = false;
     };
   }
@@ -1506,6 +1596,9 @@
       return;
     }
     const ws = t.closest('[data-wlsort]'); if (ws) { G.wlSort = ws.dataset.wlsort; saveUI(); route(); return; }
+    const wt = t.closest('[data-wltab]'); if (wt) { G.wlTab = wt.dataset.wltab; saveUI(); route(); return; }
+    const fty = t.closest('[data-favtype]'); if (fty) { G.favType = fty.dataset.favtype; saveUI(); route(); return; }
+    const jo = t.closest('[data-jf]'); if (jo && JF.conn) { window.open(`${JF.conn.url}/web/#/details?id=${jo.dataset.jf}${JF.conn.serverId ? '&serverId=' + JF.conn.serverId : ''}`, '_blank', 'noopener'); return; }
     const rq = t.closest('[data-wl-req]');
     if (rq) {
       const k = rq.dataset.wlReq; WL.setRequested(k, true);
@@ -1573,6 +1666,7 @@
   updateWlBadge();
   route();
   if (JF.conn) WL.pull().then((ch) => { if (ch) { updateWlBadge(); if (current === 'merkliste') route(); } });
+  if (JF.conn) JF.loadFavorites().then((ch) => { if (ch) $$('[data-k]').forEach((el) => paintBadges(el.dataset.k)); }).catch(() => {});
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && JF.conn && Date.now() - WL.pullTs > 60e3) WL.pull().then((ch) => { if (ch && current === 'merkliste') route(); });
   });

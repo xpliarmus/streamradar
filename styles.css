@@ -429,3 +429,10 @@ details summary { list-style: revert; }
 .diag li.ok b { color: var(--ok); }
 .diag li.bad b { color: #e5484d; }
 #wl-sync .link-btn { font-size: 12px; }
+
+/* ---------- Favoriten ---------- */
+.srv.favb { background: #e11d48; }
+.srv.favb svg { width: 13px; height: 13px; }
+.wl-tabs button { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; font-size: 14px; }
+.wl-tabs svg { width: 16px; height: 16px; }
+.poster .noimg + img { position: absolute !important; inset: 0; }
