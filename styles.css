@@ -388,3 +388,38 @@ ol.steps li { margin: 4px 0; }
 .btn.fav.on { background: #fde2e7; color: #c81e4a; }
 :root[data-theme="dark"] .btn.fav.on { background: #3a1621; color: #ff6b8e; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn.fav.on { background: #3a1621; color: #ff6b8e; } }
+
+/* ---------- Merkliste ---------- */
+#wl-btn { position: relative; }
+#wl-btn.active { color: var(--accent); background: var(--accent-soft); }
+#wl-btn .badge {
+  position: absolute; top: 3px; right: 2px; min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: 999px; background: #f59e0b; color: #1a1205; font-size: 10px; font-weight: 800;
+  display: grid; place-items: center; line-height: 1;
+}
+.wlb {
+  position: absolute; top: 5px; right: 6px; width: 22px; height: 26px;
+  display: grid; place-items: center; color: #f59e0b;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,.6));
+}
+.wlb svg { width: 20px; height: 22px; }
+:root[data-size="s"] .wlb { width: 18px; height: 20px; top: 3px; right: 4px; }
+:root[data-size="s"] .wlb svg { width: 16px; height: 18px; }
+.btn.wl.on { background: #fdecc8; color: #92560a; }
+:root[data-theme="dark"] .btn.wl.on { background: #3a2a0c; color: #fbbf24; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn.wl.on { background: #3a2a0c; color: #fbbf24; } }
+.wlrow { cursor: pointer; }
+.wlrow .lr { gap: 4px; }
+.wlrow .icon-btn { width: 34px; height: 34px; }
+.wlrow .icon-btn svg { width: 16px; height: 16px; }
+.wl-st { font-weight: 600; }
+.wl-st.ready { color: var(--accent); }
+.wl-st.soon { color: var(--warn); }
+.wl-st.server { color: var(--ok); }
+.wl-st.req { color: var(--text-2); }
+.toast { display: flex; align-items: center; gap: 12px; }
+.toast-act { background: none; border: 0; color: inherit; font-weight: 800; text-decoration: underline; padding: 0; cursor: pointer; }
+kbd { font: 12px/1 ui-monospace, monospace; padding: 2px 6px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface-2); }
+.bm { cursor: grab; }
+details summary { list-style: revert; }
+.toast { width: max-content; }

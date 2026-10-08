@@ -1,5 +1,5 @@
 /* Streamradar Service Worker: App-Shell offline, Poster-Bilder im Cache */
-const VERSION = 'sr-v1.1.0';
+const VERSION = 'sr-v1.2.0';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/favicon.svg', 'icons/icon-192.png', 'icons/apple-touch-icon.png'];
 const IMG_CACHE = 'sr-img-v1';
 const IMG_MAX = 600;

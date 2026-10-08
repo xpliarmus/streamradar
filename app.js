@@ -3,7 +3,7 @@
  */
 'use strict';
 (() => {
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const API = 'https://api.themoviedb.org/3';
   const IMG = 'https://image.tmdb.org/t/p/';
   const LANG = 'de-DE';
@@ -24,7 +24,7 @@
   const saveFilters = () => store.set('filters', F);
 
   const G = Object.assign({ status: 'all', trendWin: 'week', trendType: 'all', trendMine: true, upMode: 'tv', query: '' }, store.get('ui', {}));
-  const saveUI = () => store.set('ui', { status: G.status, trendWin: G.trendWin, trendType: G.trendType, trendMine: G.trendMine, upMode: G.upMode });
+  const saveUI = () => store.set('ui', { status: G.status, trendWin: G.trendWin, trendType: G.trendType, trendMine: G.trendMine, upMode: G.upMode, wlSort: G.wlSort });
 
   /* ================= Helpers ================= */
   const $ = (s, r = document) => r.querySelector(s);
@@ -43,9 +43,15 @@
   const key = (it) => it.type + ':' + it.id;
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-  function toast(msg, ms = 2800) {
+  function toast(msg, ms = 2800, action = null) {
     const t = $('#toast');
     t.textContent = msg; t.hidden = false;
+    if (action) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'toast-act'; b.textContent = action.label;
+      b.onclick = () => { t.hidden = true; action.fn(); };
+      t.appendChild(b);
+    }
     clearTimeout(toast._t); toast._t = setTimeout(() => { t.hidden = true; }, ms);
   }
 
@@ -284,12 +290,13 @@
       return this.syncing;
     },
     /* Favoriten: neue API (10.9+) mit Rückfall auf die ältere Route */
-    async req(method, paths) {
+    async req(method, paths, body) {
       const headers = { Authorization: this.auth(this.conn.token) };
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
       let last;
       for (const p of paths) {
         let r;
-        try { r = await fetch(this.conn.url + p, { method, headers }); } catch { throw this.netErr(this.conn.url); }
+        try { r = await fetch(this.conn.url + p, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined }); } catch { throw this.netErr(this.conn.url); }
         if (r.status === 404 || r.status === 405 || r.status === 400) { last = r; continue; }
         if (r.status === 401) throw new Error('Jellyfin-Anmeldung abgelaufen. Bitte neu verbinden.');
         if (!r.ok) throw new Error('Jellyfin-Fehler (' + r.status + ').');
@@ -298,6 +305,10 @@
       throw new Error('Jellyfin-Fehler (' + (last ? last.status : '?') + ').');
     },
     iid(type, id) { return this.lib && this.lib[type === 'movie' ? 'm' : 's'][id]; },
+    /* App-eigene Einstellungen im Jellyfin-Konto (DisplayPreferences, Client «streamradar») */
+    prefsPath() { return `/DisplayPreferences/streamradar?userId=${this.conn.userId}&client=streamradar`; },
+    async getPrefs() { return (await this.req('GET', [this.prefsPath()])) || {}; },
+    async setPrefs(dto) { await this.req('POST', [this.prefsPath()], dto); },
     async isFavorite(type, id) {
       const iid = this.iid(type, id); const u = this.conn.userId;
       const j = await this.req('GET', [`/Items?userId=${u}&Ids=${iid}&EnableUserData=true&EnableImages=false`, `/Users/${u}/Items?Ids=${iid}&EnableUserData=true&EnableImages=false`]);
@@ -324,6 +335,161 @@
     const b = $('#jf-status');
     b.classList.toggle('on', JF.ready);
     b.title = JF.ready ? `Jellyfin verbunden · ${fmtNum(JF.lib.nm)} Filme, ${fmtNum(JF.lib.ns)} Serien` : 'Jellyfin nicht verbunden';
+  }
+
+  /* ================= Merkliste (lokal + Sync über Jellyfin) ================= */
+  const WL = {
+    data: (() => { const d = store.get('wl', null); return d && d.items ? d : { items: {} }; })(),
+    lastSync: store.get('wlSync', 0),
+    err: null,
+    pushing: null,
+    pullTs: 0,
+    list() { return Object.entries(this.data.items).filter(([, v]) => !v.del).map(([k, v]) => ({ k, ...v })); },
+    has(k) { const v = this.data.items[k]; return !!(v && !v.del); },
+    count() { return this.list().length; },
+    add(it) {
+      const now = Date.now(); const k = key(it);
+      this.data.items[k] = { t: now, u: now, n: it.title || '', p: it.poster || null, d: it.date || '' };
+      this.changed([k]);
+    },
+    remove(k) {
+      const v = this.data.items[k]; if (!v || v.del) return null;
+      this.data.items[k] = { t: v.t, u: Date.now(), del: true };
+      this.changed([k]);
+      return v;
+    },
+    restore(k, v) { this.data.items[k] = { ...v, u: Date.now() }; this.changed([k]); },
+    setRequested(k, on) {
+      const v = this.data.items[k]; if (!v || v.del) return;
+      if (on) v.r = Date.now(); else delete v.r;
+      v.u = Date.now(); this.changed([k]);
+    },
+    meta(k, m) { const v = this.data.items[k]; if (!v || v.del) return; Object.assign(v, m); this.saveLocal(); },
+    changed(keys = []) { this.saveLocal(); updateWlBadge(); keys.forEach(paintWl); this.pushSoon(); },
+    saveLocal() { store.set('wl', this.data); },
+    merge(remote) {
+      let changed = false;
+      for (const [k, r] of Object.entries((remote && remote.items) || {})) {
+        const l = this.data.items[k];
+        if (!l || (r.u || 0) > (l.u || 0)) { this.data.items[k] = r; changed = true; }
+      }
+      const cutoff = Date.now() - 60 * 864e5; // Löschmarken nach 60 Tagen vergessen
+      for (const [k, v] of Object.entries(this.data.items)) if (v.del && v.u < cutoff) delete this.data.items[k];
+      return changed;
+    },
+    decode(prefs) {
+      const cp = (prefs && prefs.CustomPrefs) || {};
+      const n = +cp['wl.n'] || 0; if (!n) return null;
+      let s = ''; for (let i = 0; i < n; i++) s += cp['wl.' + i] || '';
+      try { return JSON.parse(s); } catch { return null; }
+    },
+    async pull() {
+      if (!JF.conn) return false;
+      try {
+        const prefs = await JF.getPrefs();
+        const changed = this.merge(this.decode(prefs));
+        if (changed) { this.saveLocal(); updateWlBadge(); }
+        this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync); this.pullTs = Date.now();
+        return changed;
+      } catch (e) { this.err = e.message; return false; }
+    },
+    async push() {
+      if (!JF.conn) return;
+      const prefs = await JF.getPrefs();
+      this.merge(this.decode(prefs)); this.saveLocal();
+      const json = JSON.stringify({ v: 1, items: this.data.items });
+      const cp = {};
+      for (const [k, v] of Object.entries(prefs.CustomPrefs || {})) if (!/^wl\./.test(k)) cp[k] = v;
+      const chunks = json.match(/[\s\S]{1,6000}/g) || [''];
+      chunks.forEach((c, i) => { cp['wl.' + i] = c; });
+      cp['wl.n'] = String(chunks.length);
+      const dto = Object.assign({ Id: 'streamradar', Client: 'streamradar', SortBy: 'SortName', RememberIndexing: false, PrimaryImageHeight: 0, PrimaryImageWidth: 0, ScrollDirection: 'Horizontal', ShowBackdrop: false, RememberSorting: false, SortOrder: 'Ascending', ShowSidebar: false }, prefs, { CustomPrefs: cp });
+      await JF.setPrefs(dto);
+      this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync);
+    },
+    pushSoon: debounce(() => {
+      if (!JF.conn) return;
+      WL.pushing = WL.push().catch((e) => { WL.err = e.message; toast('Merkliste nicht synchronisiert: ' + e.message, 4500); }).finally(() => { WL.pushing = null; if (current === 'merkliste') renderWlSync(); });
+    }, 1200),
+  };
+  function updateWlBadge() {
+    const b = $('#wl-btn .badge'); if (!b) return;
+    const n = WL.count();
+    b.textContent = n > 99 ? '99+' : String(n); b.hidden = !n;
+  }
+  const wlBadgeHTML = '<span class="wlb" title="Auf der Merkliste"><svg><use href="#i-bookmark-fill"/></svg></span>';
+  function paintWl(k) {
+    $$(`.tile[data-k="${k}"] .poster`).forEach((p) => {
+      const has = WL.has(k) && !p.querySelector('.srv');
+      const cur = p.querySelector('.wlb');
+      if (has && !cur) p.insertAdjacentHTML('beforeend', wlBadgeHTML);
+      if (!has && cur) cur.remove();
+    });
+  }
+
+  /* Lesezeichen-Skript für Seerr: liest die Watchlist auf der Seerr-Seite aus (eigenständig, wird als Text serialisiert) */
+  function seerrExport() {
+    (async () => {
+      const get = async (u) => { const r = await fetch(u, { credentials: 'include', headers: { accept: 'application/json' } }); if (!r.ok) throw new Error(u + ' → ' + r.status); return r.json(); };
+      try {
+        const me = await get('/api/v1/auth/me');
+        const found = new Map();
+        const bases = ['/api/v1/user/' + me.id + '/watchlist', '/api/v1/discover/watchlist'];
+        let okAny = false;
+        for (const base of bases) {
+          try {
+            let page = 1; let total = 1;
+            do {
+              const j = await get(base + '?page=' + page);
+              okAny = true;
+              total = j.totalPages || 1;
+              for (const x of (j.results || [])) {
+                const id = x.tmdbId || (x.media && x.media.tmdbId);
+                const t = x.mediaType || x.type || (x.media && x.media.mediaType);
+                if (!id || !t) continue;
+                const type = (t === 'tv' || t === 'show') ? 'tv' : 'movie';
+                found.set(type + ':' + id, { tmdbId: Number(id), type, title: x.title || x.name || '' });
+              }
+              page++;
+            } while (page <= total && page <= 50);
+          } catch (e) { /* nächste Variante versuchen */ }
+        }
+        if (!okAny) throw new Error('Keine Watchlist gefunden. Bist du in Seerr eingeloggt?');
+        const items = [...found.values()];
+        const txt = JSON.stringify({ streamradar: 1, items });
+        const d = document.createElement('div');
+        d.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;font:15px/1.4 system-ui,sans-serif';
+        d.innerHTML = '<div style="background:#fff;color:#111;padding:20px;border-radius:14px;max-width:520px;width:90%;box-shadow:0 10px 40px rgba(0,0,0,.4)"><div style="font-weight:700;font-size:17px;margin-bottom:6px">Streamradar: ' + items.length + ' Titel gefunden</div><div style="margin-bottom:10px">Klicke auf «Kopieren» und füge den Text in Streamradar unter Merkliste → Importieren ein.</div><textarea readonly style="width:100%;height:110px;font:12px monospace;border:1px solid #ccc;border-radius:8px;padding:8px"></textarea><div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button data-c style="padding:8px 16px;border-radius:8px;border:0;background:#0f766e;color:#fff;font-weight:700;cursor:pointer">Kopieren</button><button data-x style="padding:8px 16px;border-radius:8px;border:0;background:#e5e7eb;color:#111;font-weight:700;cursor:pointer">Schliessen</button></div></div>';
+        document.body.appendChild(d);
+        const ta = d.querySelector('textarea'); ta.value = txt; ta.focus(); ta.select();
+        d.querySelector('[data-c]').onclick = async (ev) => {
+          try { await navigator.clipboard.writeText(txt); } catch (e) { ta.select(); document.execCommand('copy'); }
+          ev.target.textContent = 'Kopiert ✓';
+        };
+        d.querySelector('[data-x]').onclick = () => d.remove();
+      } catch (e) { alert('Streamradar-Export: ' + e.message); }
+    })();
+  }
+  const SEERR_CODE = '(' + seerrExport.toString() + ')();';
+  const SEERR_BOOKMARKLET = 'javascript:' + encodeURIComponent(SEERR_CODE);
+
+  function importWatchlist(text) {
+    let j;
+    try { j = JSON.parse(String(text || '').trim()); } catch { throw new Error('Das sieht nicht nach einem Export aus Seerr aus. Bitte den kopierten Text vollständig einfügen.'); }
+    const arr = Array.isArray(j) ? j : (j && (j.items || j.results));
+    if (!Array.isArray(arr)) throw new Error('Keine Titel im eingefügten Text gefunden.');
+    let added = 0; let skipped = 0; const keys = []; const now = Date.now();
+    for (const x of arr) {
+      const id = Number(x.tmdbId || x.id); if (!id) continue;
+      const t = x.type || x.mediaType;
+      const type = (t === 'tv' || t === 'show') ? 'tv' : 'movie';
+      const k = type + ':' + id;
+      if (WL.has(k)) { skipped++; continue; }
+      WL.data.items[k] = { t: now - added, u: now, n: x.title || '', p: null, d: '' };
+      keys.push(k); added++;
+    }
+    WL.changed(keys);
+    return { added, skipped };
   }
 
   /* ================= Discover / Feeds ================= */
@@ -440,7 +606,7 @@
     if (o.badge === 'nextep') badge = `<span class="tile-date" data-ne ${ne && ne[2] ? '' : 'hidden'}>${ne && ne[2] ? fmtRel(ne[2]) : ''}</span>`;
     const y = year(it.date);
     return `<button class="tile" data-k="${k}" type="button">
-      <div class="poster">${img}<span class="pill ${it.type}">${it.type === 'movie' ? 'Film' : 'Serie'}</span>${JF.has(it.type, it.id) ? srvBadge : ''}<div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${badge}</div>
+      <div class="poster">${img}<span class="pill ${it.type}">${it.type === 'movie' ? 'Film' : 'Serie'}</span>${JF.has(it.type, it.id) ? srvBadge : (WL.has(k) ? wlBadgeHTML : '')}<div class="tile-prov">${provLogosHTML(provIdsFor(it))}</div>${badge}</div>
       <div class="tile-meta"><div class="t">${esc(it.title)}</div><div class="s">${y ? `<span>${y}</span>` : ''}${ratingHTML(it)}</div></div>
     </button>`;
   }
@@ -797,6 +963,136 @@
     if (matchMedia('(min-width: 900px)').matches) input.focus();
   };
 
+  /* ---- Merkliste ---- */
+  function wlStatus(type, d) {
+    const today = isoDate(0);
+    if (JF.has(type, d.id)) return { g: 'server', label: 'Auf dem Server', sort: '' };
+    const wpAll = (d['watch/providers'] && d['watch/providers'].results) || {};
+    const offered = Object.values(wpAll).some((r) => (r.flatrate || r.free || r.ads || r.rent || r.buy));
+    if (type === 'movie') {
+      const rel = d.release_date || '';
+      if (!rel || rel > today) return { g: 'soon', label: rel ? 'Kinostart ' + fmtLong(rel) : 'Erscheinungsdatum offen', sort: rel || '9999' };
+      const all = ((d.release_dates && d.release_dates.results) || []).flatMap((r) => (r.release_dates || []).map((x) => ({ type: x.type, date: (x.release_date || '').slice(0, 10) })));
+      const dig = all.filter((x) => (x.type === 4 || x.type === 5) && x.date).map((x) => x.date).sort();
+      const past = dig.filter((x) => x <= today);
+      if (past.length || offered) return { g: 'ready', label: past.length ? 'Digital seit ' + fmtLong(past[0]) : 'Erschienen ' + fmtLong(rel), sort: '' };
+      if (dig.length) return { g: 'soon', label: 'Im Kino · digital ab ' + fmtLong(dig[0]), sort: dig[0] };
+      if ((Date.now() - parseD(rel)) / 864e5 > 120) return { g: 'ready', label: 'Erschienen ' + fmtLong(rel), sort: '' };
+      return { g: 'soon', label: 'Im Kino seit ' + fmtLong(rel) + ' · digital noch offen', sort: '9998' };
+    }
+    const fa = d.first_air_date || '';
+    if (!fa || fa > today) return { g: 'soon', label: fa ? 'Start ' + fmtLong(fa) : 'Startdatum offen', sort: fa || '9999' };
+    const ne = d.next_episode_to_air;
+    const ns = d.number_of_seasons || 0;
+    return { g: 'ready', label: `${ns ? ns + ' Staffel' + (ns > 1 ? 'n' : '') : 'Serie'}${ne ? ' · nächste Episode ' + fmtRel(ne.air_date) : ''}`, sort: '' };
+  }
+
+  function wlRowHTML(x, st) {
+    const [type, id] = x.k.split(':');
+    const seerr = S.seerrUrl ? `${S.seerrUrl}/${type}/${id}` : null;
+    const jfl = JF.itemUrl(type, +id);
+    let act = '';
+    if (st.g === 'server' && jfl) act = `<a class="btn small ok" href="${jfl}" target="_blank" rel="noopener">Öffnen</a>`;
+    else if (st.g === 'ready' && seerr) act = `<a class="btn small primary" href="${seerr}" target="_blank" rel="noopener" data-wl-req="${x.k}">Requesten</a>`;
+    else if (st.g === 'req') act = `<button class="link-btn" type="button" data-wl-unreq="${x.k}" title="Markierung «angefragt» entfernen">Zurücksetzen</button>`;
+    return `<div class="lrow wlrow" data-k="${x.k}" role="button" tabindex="0">
+      <div class="lp">${x.p ? `<img src="${IMG}w92${x.p}" alt="" loading="lazy">` : ''}</div>
+      <div class="lmin"><div class="lt">${esc(x.n || '…')}</div>
+        <div class="ls"><span class="tag ${type}">${type === 'movie' ? 'Film' : 'Serie'}</span><span class="wl-st ${st.g}">${esc(st.label)}</span></div></div>
+      <div class="lr">${act}<button class="icon-btn" type="button" data-wl-remove="${x.k}" title="Von der Merkliste entfernen" aria-label="Entfernen"><svg><use href="#i-x"/></svg></button></div>
+    </div>`;
+  }
+
+  function renderWlSync() {
+    const el = $('#wl-sync'); if (!el) return;
+    if (!JF.conn) { el.innerHTML = 'Nur auf diesem Gerät gespeichert. <a href="#einstellungen" data-go="einstellungen">Jellyfin verbinden</a>, damit PC und Handy dieselbe Liste haben.'; return; }
+    if (WL.err) { el.innerHTML = `<span class="err">Synchronisation fehlgeschlagen: ${esc(WL.err)}</span>`; return; }
+    if (WL.pushing) { el.textContent = 'Synchronisiere …'; return; }
+    el.textContent = WL.lastSync ? `Mit Jellyfin synchronisiert · ${new Date(WL.lastSync).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}` : 'Mit Jellyfin synchronisiert';
+  }
+
+  VIEWS.merkliste = async (el, tok) => {
+    el.innerHTML = `<div class="view-head"><h1>Merkliste</h1><span class="spacer"></span>
+        <button class="chip" type="button" data-wl-import><svg style="width:16px;height:16px"><use href="#i-download"/></svg>Aus Seerr importieren</button></div>
+      <p class="kv" id="wl-sync" style="margin:-6px 0 14px"></p>
+      ${WL.count() > 1 ? `<div class="toolbar"><div class="seg" role="group" aria-label="Reihenfolge">${[['new', 'Neueste zuerst'], ['old', 'Älteste zuerst']].map(([v, l]) => `<button type="button" data-wlsort="${v}" aria-pressed="${(G.wlSort || 'new') === v}">${l}</button>`).join('')}</div></div>` : ''}
+      <div id="wl-body"><div class="spinner"></div></div>`;
+    renderWlSync();
+    const body = $('#wl-body', el);
+    const draw = async () => {
+      const items = WL.list();
+      if (!items.length) {
+        body.innerHTML = `<div class="card" style="max-width:640px"><h2>Noch leer</h2><p>Öffne einen Titel und tippe auf <b>«Merken»</b>, um ihn hier zu sammeln, zum Beispiel wenn er noch nicht erschienen ist oder dein Request-Kontingent für heute aufgebraucht ist.</p><button class="btn" type="button" data-wl-import>Aus Seerr importieren</button></div>`;
+        return;
+      }
+      if (!S.tmdbKey) { body.innerHTML = onboardingHTML(); return; }
+      const infos = await Promise.all(items.map(async (x) => {
+        const [type, id] = x.k.split(':');
+        try {
+          const d = await tmdb(`/${type}/${id}`, { language: LANG, append_to_response: type === 'movie' ? 'release_dates,watch/providers' : 'watch/providers' }, { ttl: 6 * 3600e3 });
+          const m = { n: d.title || d.name || x.n, p: d.poster_path || x.p, d: d.release_date || d.first_air_date || x.d };
+          if (m.n !== x.n || m.p !== x.p || m.d !== x.d) WL.meta(x.k, m);
+          let st = wlStatus(type, d);
+          if (x.r && st.g !== 'server') st = { g: 'req', label: 'Angefragt am ' + dfShort.format(new Date(x.r)) + (st.g === 'soon' ? ' · ' + st.label : ''), sort: '' };
+          return { x: { ...x, ...m }, st };
+        } catch { return { x, st: { g: 'ready', label: '', sort: '' } }; }
+      }));
+      if (!alive(tok)) return;
+      const dir = (G.wlSort || 'new') === 'new' ? -1 : 1;
+      const byAdded = (a, b) => dir * ((a.x.t || 0) - (b.x.t || 0));
+      const groups = [
+        ['ready', 'Jetzt requestbar', 'Erschienen, aber noch nicht auf dem Server', byAdded],
+        ['req', 'Angefragt', 'Angefragt, wartet auf den Server', (a, b) => (a.x.r || 0) - (b.x.r || 0)],
+        ['soon', 'Noch nicht erschienen', 'Sortiert nach Datum', (a, b) => (a.st.sort || '').localeCompare(b.st.sort || '')],
+        ['server', 'Inzwischen auf dem Server', '', byAdded],
+      ];
+      body.innerHTML = groups.map(([g, h, sub, sortFn]) => {
+        const rows = infos.filter((i) => i.st.g === g).sort(sortFn);
+        if (!rows.length) return '';
+        return `<section class="section"><div class="section-head"><div><h2>${h} <span class="kv">(${rows.length})</span></h2>${sub ? `<div class="meta">${sub}</div>` : ''}</div>
+          ${g === 'server' ? `<div class="acts"><button class="link-btn" type="button" data-wl-clear-server>Alle entfernen</button></div>` : ''}</div>
+          <div class="list">${rows.map((r) => wlRowHTML(r.x, r.st)).join('')}</div></section>`;
+      }).join('');
+    };
+    await draw();
+    if (JF.conn && Date.now() - WL.pullTs > 15e3) {
+      const changed = await WL.pull();
+      if (!alive(tok)) return;
+      renderWlSync();
+      if (changed) await draw();
+    }
+  };
+
+  function openWlImport() {
+    openSheet(`<div class="f-body"><h2>Merkliste aus Seerr importieren</h2>
+      <p class="kv" style="margin:-6px 0 14px">Einmalig am PC. Vorhandene Titel in Streamradar bleiben erhalten, doppelte werden übersprungen.</p>
+      <ol class="steps">
+        <li><b>Lesezeichenleiste einblenden:</b> <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd></li>
+        <li><b>Diesen Button in die Lesezeichenleiste ziehen</b> (nicht anklicken):<br>
+          <a class="btn small primary bm" href="${SEERR_BOOKMARKLET}" data-bm draggable="true" style="margin-top:6px">🔖 Seerr → Streamradar</a></li>
+        <li><b>Eure Seerr-Seite öffnen</b>${S.seerrUrl ? ` (<a href="${S.seerrUrl}" target="_blank" rel="noopener">${esc(S.seerrUrl.replace(/^https?:\/\//, ''))}</a>)` : ''}, einloggen und dort auf das neue Lesezeichen klicken.</li>
+        <li>Im Fenster auf <b>«Kopieren»</b> klicken, hierher zurückkehren und den Text unten einfügen.</li>
+      </ol>
+      <textarea id="wl-imp" class="input" style="height:110px;padding:10px;font:12px/1.4 monospace" placeholder='{"streamradar":1,"items":[…]}'></textarea>
+      <p id="wl-imp-msg" class="kv" style="min-height:1.4em;margin:6px 0 0"></p>
+      <div class="f-actions"><button class="btn" type="button" data-close>Abbrechen</button><button class="btn primary" type="button" id="wl-imp-go">Importieren</button></div>
+      <details style="margin-top:14px"><summary class="kv" style="cursor:pointer">Lesezeichen funktioniert nicht?</summary>
+        <p class="kv">Alternative: Auf der Seerr-Seite <kbd>F12</kbd> drücken → Reiter «Konsole» → den kopierten Code einfügen → <kbd>Enter</kbd>. Chrome und Edge verlangen beim ersten Mal, dass du zuerst <code>allow pasting</code> eintippst.</p>
+        <button class="btn small" type="button" id="wl-copy-code">Code kopieren</button></details>
+    </div>`);
+    const sb = $('.sheet-body');
+    sb.querySelector('[data-bm]').addEventListener('click', (e) => { e.preventDefault(); toast('Den Button in die Lesezeichenleiste ziehen, nicht anklicken.', 3500); });
+    sb.querySelector('#wl-copy-code').onclick = async () => { try { await navigator.clipboard.writeText(SEERR_CODE); toast('Code kopiert'); } catch { toast('Kopieren nicht möglich'); } };
+    sb.querySelector('#wl-imp-go').onclick = () => {
+      const msg = sb.querySelector('#wl-imp-msg');
+      try {
+        const r = importWatchlist(sb.querySelector('#wl-imp').value);
+        toast(`${r.added} Titel importiert${r.skipped ? `, ${r.skipped} schon vorhanden` : ''}`, 4000);
+        closeSheet(); if (current === 'merkliste') route(); else go('merkliste');
+      } catch (e) { msg.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+    };
+  }
+
   /* ---- Einstellungen ---- */
   const REGIONS = [['CH', 'Schweiz'], ['DE', 'Deutschland'], ['AT', 'Österreich'], ['US', 'USA'], ['GB', 'Grossbritannien'], ['FR', 'Frankreich'], ['IT', 'Italien']];
   const regionName = (r) => (REGIONS.find((x) => x[0] === r) || [r, r])[1];
@@ -934,6 +1230,7 @@
           try {
             await JF.connect(url, $('#jf-user', box).value.trim(), $('#jf-pw', box).value);
             toast(`Verbunden · ${fmtNum(JF.lib.nm)} Filme, ${fmtNum(JF.lib.ns)} Serien`);
+            WL.pull().then(() => { updateWlBadge(); if (WL.count()) WL.pushSoon(); });
             renderJf();
           } catch (err) { msg.innerHTML = `<span class="err">${esc(err.message)}</span>`; btn.disabled = false; }
         };
@@ -1005,7 +1302,8 @@
       actions.push(`<a class="btn ok" href="${jfLink}" target="_blank" rel="noopener"><svg><use href="#i-play"/></svg>In Jellyfin öffnen</a>`);
       actions.push('<button class="btn fav" type="button" id="d-fav" disabled><svg><use href="#i-heart"/></svg><span>Favorit</span></button>');
     }
-    if (!have) actions.push(seerr ? `<a class="btn primary" href="${seerr}" target="_blank" rel="noopener"><svg><use href="#i-plus"/></svg>Requesten</a>` : '<button class="btn" type="button" data-go="einstellungen">Seerr-Adresse hinterlegen</button>');
+    if (!have) actions.push(seerr ? `<a class="btn primary" id="d-req" href="${seerr}" target="_blank" rel="noopener"><svg><use href="#i-plus"/></svg>Requesten</a>` : '<button class="btn" type="button" data-go="einstellungen">Seerr-Adresse hinterlegen</button>');
+    actions.push(`<button class="btn wl" type="button" id="d-wl" aria-pressed="${WL.has(type + ':' + id)}"><svg><use href="#${WL.has(type + ':' + id) ? 'i-bookmark-fill' : 'i-bookmark'}"/></svg><span>${WL.has(type + ':' + id) ? 'Gemerkt' : 'Merken'}</span></button>`);
     if (trailer) actions.push(`<a class="btn" href="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}" target="_blank" rel="noopener"><svg><use href="#i-play"/></svg>Trailer</a>`);
 
     const provHTML = pids.length
@@ -1038,6 +1336,24 @@
         ${d.imdb_id ? `<a class="link-btn" href="https://www.imdb.com/title/${esc(d.imdb_id)}/" target="_blank" rel="noopener">IMDb<svg><use href="#i-ext"/></svg></a>` : ''}
       </div>`;
     if (have && JF.conn) wireFavorite(type, id, my);
+    const dr = $('#d-req');
+    if (dr) dr.addEventListener('click', () => { const k = type + ':' + id; if (WL.has(k)) { WL.setRequested(k, true); toast('Auf der Merkliste als angefragt markiert', 4500, { label: 'Rückgängig', fn: () => WL.setRequested(k, false) }); } });
+    const wb = $('#d-wl');
+    if (wb) {
+      const k = type + ':' + id;
+      const paintBtn = () => {
+        const on = WL.has(k);
+        wb.classList.toggle('on', on); wb.setAttribute('aria-pressed', on);
+        wb.querySelector('use').setAttribute('href', on ? '#i-bookmark-fill' : '#i-bookmark');
+        wb.querySelector('span').textContent = on ? 'Gemerkt' : 'Merken';
+      };
+      paintBtn();
+      wb.onclick = () => {
+        if (WL.has(k)) { const old = WL.remove(k); toast('Von der Merkliste entfernt', 4000, { label: 'Rückgängig', fn: () => { WL.restore(k, old); paintBtn(); } }); }
+        else { WL.add({ type, id, title, poster: d.poster_path, date }); toast(JF.conn ? 'Auf die Merkliste gesetzt' : 'Gemerkt (nur auf diesem Gerät – Jellyfin nicht verbunden)'); }
+        paintBtn();
+      };
+    }
   }
   openDetail.n = 0;
 
@@ -1097,6 +1413,7 @@
     const tok = ++RT;
     observers.forEach((o) => o.disconnect()); observers = [];
     $$('.tab').forEach((t) => (t.dataset.go === v ? t.setAttribute('aria-current', 'page') : t.removeAttribute('aria-current')));
+    $('#wl-btn').classList.toggle('active', v === 'merkliste');
     const el = $('#view');
     if (current !== v) window.scrollTo(0, 0);
     current = v;
@@ -1108,8 +1425,33 @@
   document.addEventListener('click', (e) => {
     const t = e.target;
     const c = t.closest('[data-close]'); if (c) { closeSheet(); return; }
+    const rm = t.closest('[data-wl-remove]');
+    if (rm) {
+      const k = rm.dataset.wlRemove; const old = WL.remove(k);
+      const row = rm.closest('.wlrow'); if (row) row.remove();
+      toast('Von der Merkliste entfernt', 4500, { label: 'Rückgängig', fn: () => { WL.restore(k, old); if (current === 'merkliste') route(); } });
+      return;
+    }
+    if (t.closest('[data-wl-import]')) { openWlImport(); return; }
+    if (t.closest('[data-wl-clear-server]')) {
+      const ks = WL.list().filter((x) => { const [ty, id] = x.k.split(':'); return JF.has(ty, +id); }).map((x) => x.k);
+      const olds = ks.map((k) => [k, WL.remove(k)]);
+      route();
+      toast(`${ks.length} Titel entfernt`, 4500, { label: 'Rückgängig', fn: () => { olds.forEach(([k, v]) => WL.restore(k, v)); route(); } });
+      return;
+    }
+    const ws = t.closest('[data-wlsort]'); if (ws) { G.wlSort = ws.dataset.wlsort; saveUI(); route(); return; }
+    const rq = t.closest('[data-wl-req]');
+    if (rq) {
+      const k = rq.dataset.wlReq; WL.setRequested(k, true);
+      toast('Als angefragt markiert', 4500, { label: 'Rückgängig', fn: () => { WL.setRequested(k, false); if (current === 'merkliste') route(); } });
+      setTimeout(() => { if (current === 'merkliste') route(); }, 400);
+      return; // Link öffnet Seerr wie gewohnt
+    }
+    const urq = t.closest('[data-wl-unreq]'); if (urq) { WL.setRequested(urq.dataset.wlUnreq, false); route(); return; }
+    if (t.closest('a[href]') && !t.closest('[data-go]')) return; // normale Links (Requesten, Öffnen) nicht abfangen
     const g = t.closest('[data-go]'); if (g) { e.preventDefault(); if (closeSheet()) pendingNav = g.dataset.go; else go(g.dataset.go); return; }
-    const tile = t.closest('[data-k]'); if (tile && (tile.classList.contains('tile') || tile.classList.contains('lrow'))) { const [type, id] = tile.dataset.k.split(':'); openDetail(type, +id); return; }
+    const tile = t.closest('[data-k]'); if (tile && (tile.classList.contains('tile') || tile.classList.contains('lrow')) && !t.closest('.sheet')) { const [type, id] = tile.dataset.k.split(':'); openDetail(type, +id); return; }
     if (t.closest('[data-retry]')) { metaPromise = null; route(); return; }
     if (t.closest('[data-hide-jfnote]')) { store.set('hideJfNote', true); t.closest('.note').remove(); return; }
     const st = t.closest('[data-status]'); if (st) { G.status = st.dataset.status; saveUI(); route(); return; }
@@ -1140,7 +1482,10 @@
   document.addEventListener('change', (e) => {
     if (e.target.id === 'fsort') { F.sort = e.target.value; saveFilters(); route(); }
   });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSheet();
+    if (e.key === 'Enter' && e.target.classList && e.target.classList.contains('wlrow')) { const [type, id] = e.target.dataset.k.split(':'); openDetail(type, +id); }
+  });
   window.addEventListener('popstate', () => {
     if (pendingNav) { const id = pendingNav; pendingNav = null; go(id); return; }
     if (!$('#sheet').hidden) closeSheet(true);
@@ -1160,7 +1505,12 @@
   applyLook();
   renderTabs();
   updateJfDot();
+  updateWlBadge();
   route();
+  if (JF.conn) WL.pull().then((ch) => { if (ch) { updateWlBadge(); if (current === 'merkliste') route(); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && JF.conn && Date.now() - WL.pullTs > 60e3) WL.pull().then((ch) => { if (ch && current === 'merkliste') route(); });
+  });
   // Bibliothek im Hintergrund auffrischen, wenn älter als 6 Stunden
   if (JF.conn && (!JF.lib || Date.now() - JF.lib.ts > 6 * 3600e3)) {
     JF.sync().then(() => { if (['start', 'entdecken', 'trends', 'demnaechst'].includes(current)) route(); }).catch((e) => toast(e.message, 4500));
