@@ -3,7 +3,7 @@
  */
 'use strict';
 (() => {
-  const VERSION = '1.2.1';
+  const VERSION = '1.2.2';
   const API = 'https://api.themoviedb.org/3';
   const IMG = 'https://image.tmdb.org/t/p/';
   const LANG = 'de-DE';
@@ -338,6 +338,8 @@
   }
 
   /* ================= Merkliste (lokal + Sync über Jellyfin) ================= */
+  const b64e = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const b64d = (s) => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return decodeURIComponent(escape(atob(s))); };
   const isNetErr = (e) => /nicht erreichbar|http:\/\//.test((e && e.message) || '');
   async function retryNet(fn, tries = 2, wait = 2000) {
     for (let i = 0; ; i++) {
@@ -377,7 +379,11 @@
       let changed = false;
       for (const [k, r] of Object.entries((remote && remote.items) || {})) {
         const l = this.data.items[k];
-        if (!l || (r.u || 0) > (l.u || 0)) { this.data.items[k] = r; changed = true; }
+        if (!l || (r.u || 0) > (l.u || 0)) {
+          this.data.items[k] = r.del ? { t: r.t, u: r.u, del: true } : { n: l && l.n, p: l && l.p, d: l && l.d, ...r };
+          if (r.r === undefined) delete this.data.items[k].r;
+          changed = true;
+        }
       }
       const cutoff = Date.now() - 60 * 864e5; // Löschmarken nach 60 Tagen vergessen
       for (const [k, v] of Object.entries(this.data.items)) if (v.del && v.u < cutoff) delete this.data.items[k];
@@ -387,12 +393,23 @@
       const cp = (prefs && prefs.CustomPrefs) || {};
       const n = +cp['wl.n'] || 0; if (!n) return null;
       let s = ''; for (let i = 0; i < n; i++) s += cp['wl.' + i] || '';
-      try { return JSON.parse(s); } catch { return null; }
+      try {
+        if (cp['wl.v'] === '2') {
+          const j = JSON.parse(b64d(s)); const items = {};
+          for (const [k, t, u, r, del] of j.i || []) items[k] = del ? { t, u, del: true } : (r ? { t, u, r } : { t, u });
+          return { items };
+        }
+        return JSON.parse(s);
+      } catch { return null; }
+    },
+    encode() {
+      const i = Object.entries(this.data.items).map(([k, v]) => [k, v.t || 0, v.u || 0, v.r || 0, v.del ? 1 : 0]);
+      return b64e(JSON.stringify({ v: 2, i }));
     },
     async pull() {
       if (!JF.conn) return false;
       try {
-        const prefs = await retryNet(() => JF.getPrefs());
+        const prefs = await JF.getPrefs();
         const remote = this.decode(prefs) || { items: {} };
         const changed = this.merge(remote);
         if (changed) { this.saveLocal(); updateWlBadge(); }
@@ -409,12 +426,13 @@
       if (!JF.conn) return;
       const prefs = await JF.getPrefs();
       this.merge(this.decode(prefs)); this.saveLocal();
-      const json = JSON.stringify({ v: 1, items: this.data.items });
+      const code = this.encode();
       const cp = {};
-      for (const [k, v] of Object.entries(prefs.CustomPrefs || {})) if (!/^wl\./.test(k)) cp[k] = v;
-      const chunks = json.match(/[\s\S]{1,6000}/g) || [''];
+      for (const [k, v] of Object.entries(prefs.CustomPrefs || {})) if (!/^(wl|sr)\./.test(k)) cp[k] = v;
+      const chunks = code.match(/[\s\S]{1,6000}/g) || [''];
       chunks.forEach((c, i) => { cp['wl.' + i] = c; });
       cp['wl.n'] = String(chunks.length);
+      cp['wl.v'] = '2';
       const dto = Object.assign({ Id: 'streamradar', Client: 'streamradar', SortBy: 'SortName', RememberIndexing: false, PrimaryImageHeight: 0, PrimaryImageWidth: 0, ScrollDirection: 'Horizontal', ShowBackdrop: false, RememberSorting: false, SortOrder: 'Ascending', ShowSidebar: false }, prefs, { CustomPrefs: cp });
       await JF.setPrefs(dto);
       this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync);
@@ -423,13 +441,10 @@
     pushSoon: debounce(() => {
       if (!JF.conn) return;
       if (current === 'merkliste') { WL.pushing = true; renderWlSync(); }
-      WL.pushing = retryNet(() => WL.push())
+      // bewusst ohne automatische Wiederholungen: Schutzfilter vor dem Server sperren sonst schnell die IP
+      WL.pushing = WL.push()
         .then(() => { WL.retries = 0; })
-        .catch((e) => {
-          WL.err = e.message;
-          if (isNetErr(e) && WL.retries < 3) { WL.retries++; setTimeout(() => WL.pushSoon(), 15000 * WL.retries); }
-          else toast('Merkliste nicht synchronisiert: ' + e.message, 4500);
-        })
+        .catch((e) => { WL.err = e.message; })
         .finally(() => { WL.pushing = null; if (current === 'merkliste') renderWlSync(); });
     }, 1200),
   };
@@ -1024,12 +1039,39 @@
     </div>`;
   }
 
+  async function wlDiagnose() {
+    openSheet('<div class="f-body"><h2>Sync testen</h2><div id="wl-diag"><div class="spinner"></div></div></div>');
+    const steps = [];
+    const run = async (name, fn) => {
+      try { const info = await fn(); steps.push([true, name, info || '']); return true; }
+      catch (e) { steps.push([false, name, e.message]); console.warn('[Streamradar] ' + name + ' fehlgeschlagen:', e); return false; }
+    };
+    let prefs = null;
+    if (!JF.conn) steps.push([false, 'Jellyfin-Verbindung', 'Nicht verbunden']);
+    else {
+      await run('1. Einstellungen in Jellyfin lesen', async () => { prefs = await JF.getPrefs(); return Object.keys(prefs.CustomPrefs || {}).length + ' Werte vorhanden'; });
+      if (prefs) {
+        await run('2. Kleinen Testwert speichern', async () => { await JF.setPrefs({ ...prefs, CustomPrefs: { ...(prefs.CustomPrefs || {}), 'sr.test': 'ok' + Date.now() } }); });
+        await run('3. Merkliste speichern', async () => { await WL.push(); return WL.count() + ' Titel'; });
+        await run('4. Merkliste wieder lesen', async () => { const d = WL.decode(await JF.getPrefs()); return d ? Object.values(d.items).filter((v) => !v.del).length + ' Titel in Jellyfin' : 'leer'; });
+      }
+    }
+    const ok = steps.every((s) => s[0]);
+    if (ok) { WL.err = null; WL.retries = 0; WL.lastSync = Date.now(); store.set('wlSync', WL.lastSync); }
+    const box = $('#wl-diag'); if (!box) return;
+    box.innerHTML = `<ul class="diag">${steps.map(([s, n, i]) => `<li class="${s ? 'ok' : 'bad'}"><b>${s ? '✓' : '✗'} ${esc(n)}</b>${i ? `<br><span class="kv">${esc(i)}</span>` : ''}</li>`).join('')}</ul>
+      <p class="kv">${ok ? 'Alles in Ordnung. Die Merkliste ist in deinem Jellyfin-Konto gespeichert.' : 'Schick mir bitte einen Screenshot dieses Fensters oder die Liste oben als Text.'}</p>
+      <p class="kv">Streamradar ${VERSION}</p>
+      <div class="f-actions"><button class="btn primary" type="button" data-close>Schliessen</button></div>`;
+    if (current === 'merkliste') renderWlSync();
+  }
+
   function renderWlSync() {
     const el = $('#wl-sync'); if (!el) return;
     if (!JF.conn) { el.innerHTML = 'Nur auf diesem Gerät gespeichert. <a href="#einstellungen" data-go="einstellungen">Jellyfin verbinden</a>, damit PC und Handy dieselbe Liste haben.'; return; }
-    if (WL.err) { el.innerHTML = `<span class="err">Synchronisation fehlgeschlagen: ${esc(WL.err)}</span> <button class="link-btn" type="button" data-wl-resync>Erneut versuchen</button>`; return; }
+    if (WL.err) { el.innerHTML = `<span class="err">Synchronisation fehlgeschlagen: ${esc(WL.err)}</span> <button class="link-btn" type="button" data-wl-resync>Erneut versuchen</button> · <button class="link-btn" type="button" data-wl-diag>Sync testen</button>`; return; }
     if (WL.pushing) { el.textContent = 'Synchronisiere …'; return; }
-    el.textContent = WL.lastSync ? `Mit Jellyfin synchronisiert · ${new Date(WL.lastSync).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}` : 'Mit Jellyfin synchronisiert';
+    el.innerHTML = `${WL.lastSync ? `Mit Jellyfin synchronisiert · ${new Date(WL.lastSync).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}` : 'Mit Jellyfin synchronisiert'} · <button class="link-btn" type="button" data-wl-diag>Sync testen</button>`;
   }
 
   VIEWS.merkliste = async (el, tok) => {
@@ -1454,6 +1496,7 @@
       return;
     }
     if (t.closest('[data-wl-import]')) { openWlImport(); return; }
+    if (t.closest('[data-wl-diag]')) { wlDiagnose(); return; }
     if (t.closest('[data-wl-resync]')) { WL.err = null; WL.retries = 0; WL.pushSoon(); renderWlSync(); return; }
     if (t.closest('[data-wl-clear-server]')) {
       const ks = WL.list().filter((x) => { const [ty, id] = x.k.split(':'); return JF.has(ty, +id); }).map((x) => x.k);

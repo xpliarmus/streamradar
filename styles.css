@@ -423,3 +423,9 @@ kbd { font: 12px/1 ui-monospace, monospace; padding: 2px 6px; border-radius: 5px
 .bm { cursor: grab; }
 details summary { list-style: revert; }
 .toast { width: max-content; }
+
+.diag { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+.diag li { padding: 10px 12px; border-radius: 10px; background: var(--surface-2); font-size: 14px; }
+.diag li.ok b { color: var(--ok); }
+.diag li.bad b { color: #e5484d; }
+#wl-sync .link-btn { font-size: 12px; }
