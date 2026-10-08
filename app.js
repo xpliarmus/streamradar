@@ -3,7 +3,7 @@
  */
 'use strict';
 (() => {
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
   const API = 'https://api.themoviedb.org/3';
   const IMG = 'https://image.tmdb.org/t/p/';
   const LANG = 'de-DE';
@@ -338,6 +338,12 @@
   }
 
   /* ================= Merkliste (lokal + Sync über Jellyfin) ================= */
+  const isNetErr = (e) => /nicht erreichbar|http:\/\//.test((e && e.message) || '');
+  async function retryNet(fn, tries = 2, wait = 2000) {
+    for (let i = 0; ; i++) {
+      try { return await fn(); } catch (e) { if (i + 1 >= tries || !isNetErr(e)) throw e; await new Promise((ok) => setTimeout(ok, wait)); }
+    }
+  }
   const WL = {
     data: (() => { const d = store.get('wl', null); return d && d.items ? d : { items: {} }; })(),
     lastSync: store.get('wlSync', 0),
@@ -386,10 +392,16 @@
     async pull() {
       if (!JF.conn) return false;
       try {
-        const prefs = await JF.getPrefs();
-        const changed = this.merge(this.decode(prefs));
+        const prefs = await retryNet(() => JF.getPrefs());
+        const remote = this.decode(prefs) || { items: {} };
+        const changed = this.merge(remote);
         if (changed) { this.saveLocal(); updateWlBadge(); }
-        this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync); this.pullTs = Date.now();
+        this.pullTs = Date.now();
+        // Lokale Änderungen, die Jellyfin noch nicht kennt (z.B. nach einem fehlgeschlagenen Upload), nachreichen
+        const ri = remote.items || {};
+        const needPush = Object.entries(this.data.items).some(([k, v]) => !ri[k] || (v.u || 0) > (ri[k].u || 0));
+        if (needPush) this.pushSoon();
+        else { this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync); }
         return changed;
       } catch (e) { this.err = e.message; return false; }
     },
@@ -407,9 +419,18 @@
       await JF.setPrefs(dto);
       this.err = null; this.lastSync = Date.now(); store.set('wlSync', this.lastSync);
     },
+    retries: 0,
     pushSoon: debounce(() => {
       if (!JF.conn) return;
-      WL.pushing = WL.push().catch((e) => { WL.err = e.message; toast('Merkliste nicht synchronisiert: ' + e.message, 4500); }).finally(() => { WL.pushing = null; if (current === 'merkliste') renderWlSync(); });
+      if (current === 'merkliste') { WL.pushing = true; renderWlSync(); }
+      WL.pushing = retryNet(() => WL.push())
+        .then(() => { WL.retries = 0; })
+        .catch((e) => {
+          WL.err = e.message;
+          if (isNetErr(e) && WL.retries < 3) { WL.retries++; setTimeout(() => WL.pushSoon(), 15000 * WL.retries); }
+          else toast('Merkliste nicht synchronisiert: ' + e.message, 4500);
+        })
+        .finally(() => { WL.pushing = null; if (current === 'merkliste') renderWlSync(); });
     }, 1200),
   };
   function updateWlBadge() {
@@ -1006,7 +1027,7 @@
   function renderWlSync() {
     const el = $('#wl-sync'); if (!el) return;
     if (!JF.conn) { el.innerHTML = 'Nur auf diesem Gerät gespeichert. <a href="#einstellungen" data-go="einstellungen">Jellyfin verbinden</a>, damit PC und Handy dieselbe Liste haben.'; return; }
-    if (WL.err) { el.innerHTML = `<span class="err">Synchronisation fehlgeschlagen: ${esc(WL.err)}</span>`; return; }
+    if (WL.err) { el.innerHTML = `<span class="err">Synchronisation fehlgeschlagen: ${esc(WL.err)}</span> <button class="link-btn" type="button" data-wl-resync>Erneut versuchen</button>`; return; }
     if (WL.pushing) { el.textContent = 'Synchronisiere …'; return; }
     el.textContent = WL.lastSync ? `Mit Jellyfin synchronisiert · ${new Date(WL.lastSync).toLocaleString('de-CH', { dateStyle: 'short', timeStyle: 'short' })}` : 'Mit Jellyfin synchronisiert';
   }
@@ -1433,6 +1454,7 @@
       return;
     }
     if (t.closest('[data-wl-import]')) { openWlImport(); return; }
+    if (t.closest('[data-wl-resync]')) { WL.err = null; WL.retries = 0; WL.pushSoon(); renderWlSync(); return; }
     if (t.closest('[data-wl-clear-server]')) {
       const ks = WL.list().filter((x) => { const [ty, id] = x.k.split(':'); return JF.has(ty, +id); }).map((x) => x.k);
       const olds = ks.map((k) => [k, WL.remove(k)]);
